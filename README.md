@@ -27,14 +27,15 @@ Giữ nguyên từ bản tĩnh: giao diện, nhân vật 3D nam/nữ, Quiz 600 c
 
 ```
 server-deploy/
-├── server.js          # Server Node (chi dung thu vien co san, khong can npm install)
+├── server.js          # Server Node (SQLite mac dinh; Postgres qua DATABASE_URL)
 ├── public/
 │   ├── index.html     # Giao dien game — ban sao Y NGUYEN file tinh hien tai
 │   └── sync.js        # Lop dong bo: noi game tinh voi API server (khong sua game goc)
-├── package.json       # start: node server.js (Node >= 22)
-├── render.yaml        # Blueprint de Render tu tao service
+├── package.json       # start: node server.js (Node >= 22); phu thuoc: pg (Postgres)
+├── render.yaml        # Blueprint de Render tu tao service (khai bao DATABASE_URL, khong ghi chuoi that)
 ├── test-smoke.sh      # Kiem thu nhanh bang curl (dang ky, check-in, nhan tin, dau PvP...)
-├── .env.example       # Bien moi truong mau
+├── test-pgmem.js      # Kiem thu duong Postgres bang pg-mem (npm run test-pgmem)
+├── .env.example       # Bien moi truong mau (gom mau DATABASE_URL)
 └── data/              # SQLite (scambuster.db) — KHONG day len Git (da co trong .gitignore)
 ```
 
@@ -82,9 +83,58 @@ deploy được — đây là thứ duy nhất còn thiếu, code đã xong.
 4. Lưu ý gói Free: Render tắt máy sau 15 phút không có ai vào (lần vào
    đầu sau đó sẽ chậm ~30–60 giây để máy "tỉnh" lại — bình thường), và
    **dữ liệu SQLite sẽ mất khi redeploy**. Muốn giữ lâu dài cho lớp học:
-   nâng cấp plan trả phí rồi gắn **Persistent Disk** (mount vào thư mục
-   `data`), hoặc chuyển sang Postgres (cần sửa thêm lớp store — đã thiết
-   kế sẵn interface để thay, xem `server.js` phần "LƯU TRỮ").
+   làm mục **"Lưu trữ bền với Neon Postgres"** ngay dưới đây — không cần
+   nâng cấp plan trả phí, không cần gắn disk.
+
+## Lưu trữ bền với Neon Postgres (khuyên dùng — miễn phí, không hết hạn)
+
+**Vì sao chọn Neon mà không phải Postgres của Render?** Postgres miễn phí
+của Render **hết hạn sau 90 ngày** và sau đó mất dữ liệu. Neon gói Free
+**không hết hạn, không cần thẻ ngân hàng**, 1 GB dữ liệu (đủ cho hàng nghìn
+học sinh chơi ScamBuster), tự "ngủ" khi không ai dùng và tự tỉnh khi có
+người vào (lần đầu hơi chậm vài giây, bình thường). Server đã viết sẵn lớp
+`PostgresStore` (phiên bản 1.1.0): chỉ cần đặt biến `DATABASE_URL` là
+server tự dùng Postgres thay cho SQLite; nếu `DATABASE_URL` sai hoặc Neon
+lỗi, server tự rơi về SQLite để link không sập.
+
+**Các bước làm trên điện thoại (Isabella làm, khoảng 10 phút):**
+
+1. Mở [neon.tech](https://neon.tech) → **Sign up** bằng Gmail
+   (dùng Gmail nào cũng được, nên dùng `quyenledttn98@gmail.com` cho cùng
+   một chỗ với GitHub/Render) → xác minh email nếu Neon hỏi.
+2. **Create a project**: đặt tên project `scambuster` → Region chọn
+   **Singapore** (gần Việt Nam nhất, vào nhanh) → Postgres version mặc
+   định → **Create project**.
+3. Neon hiện bảng **Connection Details**: bấm **Copy** ở dòng
+   **Connection string** — chuỗi có dạng:
+   `postgres://<user>:<mat-khau>@ep-xxx-123456.ap-southeast-1.aws.neon.tech/neondb?sslmode=require`
+   (đây là **mật khẩu thật của database — chỉ mình bạn giữ, đừng gửi cho
+   ai, đừng dán vào nhóm chat lớp**).
+4. Mở [Render Dashboard](https://dashboard.render.com) → service
+   **scambuster-server** → **Environment** → **Add Environment Variable**:
+   - **Key:** `DATABASE_URL` (viết đúng y như vậy, chữ hoa)
+   - **Value:** dán nguyên chuỗi vừa copy ở bước 3
+   → **Save Changes**.
+5. Vẫn trong Render, bấm **Manual Deploy → Deploy latest commit** (hoặc
+   **Clear build cache & deploy** nếu có) để server chạy lại với code mới
+   1.1.0. Chờ báo **Live**.
+6. Kiểm tra: mở `https://scambuster-server.onrender.com/api/health` —
+   phải trả `"store":"postgres"` (chứ không phải `"sqlite"` nữa) và
+   `"version":"1.1.0"`. Sau đó mở link game, đăng ký lại tài khoản và chơi
+   thử 1 lượt Quiz.
+
+**Cảnh báo đọc kỹ trước khi chuyển:**
+- Chuyển sang Postgres là **database mới hoàn toàn**: 20 người mẫu được
+  seed lại y như cũ, nhưng **tài khoản thật cũ trên SQLite sẽ KHÔNG tự
+  chuyển sang** — ai đã đăng ký trên link Render phải **đăng ký lại đúng
+  tên cũ** (mật khẩu tự đặt lại). Lúc chuyển (09/11/2026), trên Render chỉ
+  có 1 tài khoản thật là **Hoàng Lâm (0 XP)** nên thiệt hại gần như bằng 0;
+  tài khoản **Quyên Lê đã mất từ trước** vì SQLite bị reset, không lấy lại
+  được. Chuyển càng sớm càng đỡ mất tài khoản.
+- Sau khi chuyển xong, **đừng xoá project Neon, đừng xoá biến
+  `DATABASE_URL` trên Render** — xoá là mất toàn bộ tài khoản.
+- Neon Free tự "ngủ" khi không ai dùng: lần vào đầu sau một lúc không ai
+  chơi có thể chậm vài giây, đó là bình thường, không phải lỗi.
 
 ## Deploy lên Railway (phương án 2)
 
@@ -133,7 +183,7 @@ Thưởng đấu trực tiếp (giống bản tĩnh đấu Bot): thắng trận 
 - Người chơi mới đăng ký trên link mới sẽ hiện ngay trong tab Người chơi
   trên mọi máy khác (sau tối đa ~20 giây, là chu kỳ poll của client).
 
-## Kết quả kiểm thử (08/11/2026, chạy local trên máy này)
+## Kết quả kiểm thử (08/11/2026, chạy local trên máy này — và 09/11/2026 cho bản 1.1.0)
 
 - **Smoke test `test-smoke.sh`: 18/18 đạt** với store SQLite
   (`node:sqlite`), và **18/18 đạt** với store JSON dự phòng (`STORE=json`):
@@ -143,6 +193,25 @@ Thưởng đấu trực tiếp (giống bản tĩnh đấu Bot): thắng trận 
   `/api/me` trả đúng tiến trình, gửi + đọc tin nhắn riêng, ghép đấu trực
   tiếp 2 người, đấu Quiz–Race thắng 2/3 lượt và kết thúc + thưởng XP,
   xuất CSV ẩn danh, heartbeat.
+- **Bản 1.1.0 (09/11/2026): chạy lại `test-smoke.sh` ở chế độ SQLite vẫn
+  18/18 đạt** (health báo `store:"sqlite"`, `version:"1.1.0"`) — việc thêm
+  Postgres không làm hỏng đường SQLite cũ.
+- **Đường Postgres (09/11/2026): `npm run test-pgmem` 23/23 đạt** — cùng
+  luồng API đầy đủ (health báo `store:"postgres"`, seed 20 người mẫu,
+  đăng ký 2 tài khoản, chặn trùng tên/sai mật khẩu, login, check-in Ngày 1
+  + chặn lần 2, sync, `/api/me`, nhắn tin 2 chiều, ghép đấu 2 người, đấu
+  Quiz–Race thắng 2/3 + thưởng XP, CSV, heartbeat).
+  **Giới hạn nói rõ:** test này dùng **pg-mem (bộ giả lập Postgres trong
+  bộ nhớ), không phải Postgres thật** — trên máy này không có sẵn
+  Postgres thật, không có Docker/psql để chạy một server Postgres thật.
+  pg-mem đạt không đảm bảo 100% Neon thật sẽ đạt; sau khi đặt
+  `DATABASE_URL` trên Render, **bắt buộc chạy lại `test-smoke.sh` trỏ vào
+  link Render** (xem mục Neon ở trên, bước 6) trước khi gửi link cho học
+  sinh.
+- **Rơi về SQLite khi Postgres lỗi (09/11/2026):** chạy server với
+  `DATABASE_URL` trỏ tới Postgres không tồn tại → log
+  `[store] postgres that bai, roi ve sqlite`, server vẫn lên và
+  `/api/health` trả `store:"sqlite"` — link không sập vì Neon lỗi.
 - **Bền dữ liệu**: kill server rồi khởi động lại cùng `DATA_DIR`, tài khoản
   Quyên Lê vẫn còn nguyên trong `/api/state` (đã kiểm chứng).
 - **Thưởng đấu PvP đã kiểm chứng trong DB**: người thắng 150 XP / 65 coins /
@@ -158,9 +227,14 @@ Thưởng đấu trực tiếp (giống bản tĩnh đấu Bot): thắng trận 
 
 - **Chưa deploy thật**: chưa có link công khai nào của bản này — cần tài
   khoản GitHub + Render/Railway (xem mục Deploy ở trên). Không bịa link.
-- **Dữ liệu chưa bền trên gói free**: SQLite trên ổ đĩa tạm của Render/
-  Railway free sẽ mất khi redeploy. Cần Persistent Disk/Volume (trả phí)
-  hoặc Postgres để giữ lâu dài cho lớp học.
+- **Dữ liệu bền trên gói free — code đã xong (1.1.0), còn chờ bật Neon**:
+  `PostgresStore` đã viết xong, `DATABASE_URL` đã khai báo trong
+  `render.yaml`/`.env.example`, test pg-mem 23/23 đạt, rơi về SQLite khi
+  Postgres lỗi đã kiểm chứng. **Chưa làm:** tạo tài khoản/project Neon,
+  đặt `DATABASE_URL` trên Render, deploy lại và chạy lại smoke test trên
+  link thật. Chưa tạo tài khoản Neon nào, chưa đẩy code 1.1.0 lên GitHub,
+  chưa deploy lên Render. **Chưa kiểm thử trên Postgres thật** (xem mục
+  Kết quả kiểm thử) — chỉ mới kiểm thử bằng pg-mem.
 - **Đấu trực tiếp dùng polling HTTP** (hỏi mỗi 2–3 giây), không phải thời
   gian thực qua WebSocket như game lớn — đủ cho lớp học, nhưng 2 người phải
   cùng bấm "Tìm trận" trong vòng ~2 phút mới ghép được nhau (hàng chờ hết

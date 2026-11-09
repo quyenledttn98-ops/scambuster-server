@@ -1,5 +1,10 @@
 /**
- * ScamBuster — server co may chu (Node >= 22, KHONG can cai them goi nao).
+ * ScamBuster — server co may chu (Node >= 22).
+ * Luu tru mac dinh: SQLite (node:sqlite, khong can goi ngoai).
+ * Luu tru ben (khuyen dung): Postgres qua bien DATABASE_URL (Neon free,
+ * khong het han sau 90 ngay nhu Render Postgres) — can goi 'pg'.
+ * Neu DATABASE_URL khong co hoac Postgres loi, server tu roi ve SQLite
+ * (khong crash) de link cu van chay.
  *
  * Giai quyet dung van de cua ban tinh Netlify:
  *  - Tai khoan luu tren server (SQLite) nen dang nhap duoc o BAT KY thiet bi nao.
@@ -17,9 +22,9 @@
  *  - Mat khau cua tai khoan cu (ban fullstack trong Muse) KHONG the chuyen
  *    sang day vi khong co hash mat khau. Nguoi choi that phai dang ky lai
  *    tren host moi (ten cu van dung duoc). 20 nguoi mau duoc seed san.
- *  - Render goi free: file SQLite nam tren o dia tam thoi, se mat khi
- *    redeploy/restart may chu. Muon giu lau dai: gan Persistent Disk
- *    (goi tra phi) hoac chuyen sang Postgres — xem README.md.
+ * Render goi free: file SQLite nam tren o dia tam thoi, se mat khi
+ *    redeploy/restart may chu. Muon giu lau dai: dat DATABASE_URL (Neon
+ *    Postgres free) — xem README.md muc "Luu tru ben voi Neon Postgres".
  */
 'use strict';
 
@@ -31,7 +36,8 @@ const crypto = require('node:crypto');
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const STORE_KIND = (process.env.STORE || 'sqlite').toLowerCase();
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
+let ACTIVE_STORE_KIND = STORE_KIND; // loai store THUC TE dang dung: postgres | sqlite | json
 
 const XP_PER_LEVEL = 10000;
 const MAX_LEVEL = 100;
@@ -105,7 +111,12 @@ const SHOWCASE = [
 /* ================= LUU TRU =================
  * Mac dinh: SQLite qua node:sqlite (co san tu Node 22, khong can npm install).
  * Du phong: STORE=json -> file JSON (data/store.json) khi host dung Node cu.
- * Ca hai deu co cung interface, de sau nay doi sang Postgres chi can them 1 store.
+ * Ben lau dai: Postgres (DATABASE_URL) — class PostgresStore duoi day.
+ * Ca ba deu co cung interface (getPlayerByKey, listPlayers, insertPlayer,
+ * updatePlayer, createSession, insertMessage, thread, findWaitingMatch,
+ * createMatch, upsertRound...). Postgres la async, SQLite/JSON la sync —
+ * moi cho goi store trong handleApi deu dung `await` (await gia tri sync
+ * van chay binh thuong) nen ca ba store doi duoc cho nhau.
  */
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -312,14 +323,216 @@ class JsonStore {
   listRounds(matchId) { return this.d.match_rounds.filter((r) => r.match_id === Number(matchId)).sort((a, b) => a.round_no - b.round_no); }
 }
 
-let store;
-try {
-  if (STORE_KIND === 'json') throw new Error('forced json store');
-  store = new SqliteStore(path.join(DATA_DIR, 'scambuster.db'));
-  console.log('[store] sqlite:', path.join(DATA_DIR, 'scambuster.db'));
-} catch (e) {
-  store = new JsonStore(path.join(DATA_DIR, 'store.json'));
-  console.log('[store] json fallback:', e.message);
+class PostgresStore {
+  // pool: pg Pool that (test co the truyen Pool cua pg-mem vao).
+  constructor(pool) { this.pool = pool; }
+  static async create(connectionString) {
+    const { Pool } = require('pg');
+    const pool = new Pool({
+      connectionString,
+      ssl: { rejectUnauthorized: false }, // Neon bat buoc SSL
+      max: 3, // Render free + Neon scale-to-zero: it ket noi dong thoi
+      connectionTimeoutMillis: 10000,
+      idleTimeoutMillis: 30000,
+    });
+    const store = new PostgresStore(pool);
+    try { await store.init(); } catch (e) { await pool.end().catch(() => {}); throw e; }
+    return store;
+  }
+  async close() { if (this.pool && this.pool.end) await this.pool.end().catch(() => {}); }
+  async init() {
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS players(
+      id SERIAL PRIMARY KEY, key TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+      gender TEXT NOT NULL DEFAULT 'male', pass_hash TEXT, xp INTEGER NOT NULL DEFAULT 0,
+      coins INTEGER NOT NULL DEFAULT 0, streak INTEGER NOT NULL DEFAULT 0,
+      checked_day TEXT NOT NULL DEFAULT '', wins INTEGER NOT NULL DEFAULT 0,
+      state_json TEXT NOT NULL DEFAULT '{}', is_showcase BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL, last_seen_at TIMESTAMPTZ NOT NULL);
+    CREATE TABLE IF NOT EXISTS sessions(
+      token TEXT PRIMARY KEY, player_id INTEGER NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+      last_seen_at TIMESTAMPTZ NOT NULL);
+    CREATE TABLE IF NOT EXISTS messages(
+      id SERIAL PRIMARY KEY, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
+      body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, is_read BOOLEAN NOT NULL DEFAULT FALSE);
+    CREATE TABLE IF NOT EXISTS matches(
+      id SERIAL PRIMARY KEY, a_key TEXT NOT NULL, b_key TEXT,
+      status TEXT NOT NULL DEFAULT 'waiting', a_wins INTEGER NOT NULL DEFAULT 0,
+      b_wins INTEGER NOT NULL DEFAULT 0, round_no INTEGER NOT NULL DEFAULT 1,
+      awarded INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL);
+    CREATE TABLE IF NOT EXISTS match_rounds(
+      id SERIAL PRIMARY KEY, match_id INTEGER NOT NULL, round_no INTEGER NOT NULL,
+      kind TEXT NOT NULL, a_score INTEGER, b_score INTEGER,
+      UNIQUE(match_id, round_no));`);
+    await this.seed();
+  }
+  // Chuan hoa hang Postgres ve dung hinh dang hang SQLite de code con lai
+  // khong phai doi: boolean -> 1/0, Date -> chuoi ISO, count -> so.
+  static _iso(v) { return v instanceof Date ? v.toISOString() : v; }
+  static _player(r) {
+    if (!r) return null;
+    return { ...r, is_showcase: r.is_showcase ? 1 : 0,
+      created_at: PostgresStore._iso(r.created_at), last_seen_at: PostgresStore._iso(r.last_seen_at) };
+  }
+  static _message(r) {
+    if (!r) return null;
+    return { ...r, is_read: r.is_read ? 1 : 0, created_at: PostgresStore._iso(r.created_at) };
+  }
+  static _match(r) {
+    if (!r) return null;
+    return { ...r, created_at: PostgresStore._iso(r.created_at), updated_at: PostgresStore._iso(r.updated_at) };
+  }
+  async seed() {
+    const { rows } = await this.pool.query('SELECT COUNT(*)::int AS c FROM players WHERE is_showcase = TRUE');
+    if (rows[0].c > 0) return;
+    const now = Date.now();
+    for (const p of SHOWCASE) {
+      await this.pool.query(`INSERT INTO players
+        (key,name,gender,pass_hash,xp,coins,streak,checked_day,wins,state_json,is_showcase,created_at,last_seen_at)
+        VALUES ($1,$2,$3,NULL,$4,$5,$6,'',$7,'{}',TRUE,$8,$9)`,
+        [normKey(p.name), p.name, p.gender, p.xp, p.coins, p.streak, p.wins,
+          new Date(now).toISOString(), new Date(now - p.mins * 60000).toISOString()]);
+    }
+  }
+  async getPlayerByKey(key) {
+    const { rows } = await this.pool.query('SELECT * FROM players WHERE key=$1', [key]);
+    return PostgresStore._player(rows[0]) || null;
+  }
+  async getPlayerById(id) {
+    const { rows } = await this.pool.query('SELECT * FROM players WHERE id=$1', [id]);
+    return PostgresStore._player(rows[0]) || null;
+  }
+  async listPlayers() {
+    const { rows } = await this.pool.query('SELECT * FROM players ORDER BY is_showcase ASC, xp DESC');
+    return rows.map(PostgresStore._player);
+  }
+  async insertPlayer(p) {
+    const { rows } = await this.pool.query(`INSERT INTO players
+      (key,name,gender,pass_hash,xp,coins,streak,checked_day,wins,state_json,is_showcase,created_at,last_seen_at)
+      VALUES ($1,$2,$3,$4,0,0,0,'',0,'{}',FALSE,$5,$6) RETURNING *`,
+      [p.key, p.name, p.gender, p.pass_hash, nowISO(), nowISO()]);
+    return PostgresStore._player(rows[0]);
+  }
+  async updatePlayer(key, fields) {
+    const allowed = new Set(['gender', 'pass_hash', 'xp', 'coins', 'streak', 'checked_day', 'wins', 'state_json', 'is_showcase', 'created_at', 'last_seen_at']);
+    const keys = Object.keys(fields).filter((k) => allowed.has(k));
+    if (!keys.length) return;
+    const set = keys.map((k, i) => `${k}=$${i + 1}`).join(', ');
+    await this.pool.query(`UPDATE players SET ${set} WHERE key=$${keys.length + 1}`,
+      [...keys.map((k) => fields[k]), key]);
+  }
+  async touchPlayer(key) { await this.updatePlayer(key, { last_seen_at: nowISO() }); }
+  async createSession(playerId, token) {
+    await this.pool.query('INSERT INTO sessions(token,player_id,created_at,last_seen_at) VALUES ($1,$2,$3,$4)',
+      [token, playerId, nowISO(), nowISO()]);
+  }
+  async getSession(token) {
+    const { rows } = await this.pool.query('SELECT * FROM sessions WHERE token=$1', [token]);
+    const s = rows[0];
+    if (!s) return null;
+    if (Date.now() - Date.parse(s.created_at) > SESSION_TTL_MS) { await this.deleteSession(token); return null; }
+    return { ...s, created_at: PostgresStore._iso(s.created_at), last_seen_at: PostgresStore._iso(s.last_seen_at) };
+  }
+  async touchSession(token) {
+    await this.pool.query('UPDATE sessions SET last_seen_at=$1 WHERE token=$2', [nowISO(), token]);
+  }
+  async deleteSession(token) { await this.pool.query('DELETE FROM sessions WHERE token=$1', [token]); }
+  async insertMessage(fromKey, toKey, body) {
+    const { rows } = await this.pool.query(
+      'INSERT INTO messages(from_key,to_key,body,created_at) VALUES ($1,$2,$3,$4) RETURNING id',
+      [fromKey, toKey, body, nowISO()]);
+    return rows[0].id;
+  }
+  async thread(a, b) {
+    const { rows } = await this.pool.query(`SELECT * FROM messages WHERE
+      (from_key=$1 AND to_key=$2) OR (from_key=$2 AND to_key=$1) ORDER BY id ASC LIMIT 200`, [a, b]);
+    return rows.map(PostgresStore._message);
+  }
+  async markRead(toKey, fromKey) {
+    await this.pool.query('UPDATE messages SET is_read=TRUE WHERE to_key=$1 AND from_key=$2', [toKey, fromKey]);
+  }
+  async unreadCount(toKey) {
+    const { rows } = await this.pool.query('SELECT COUNT(*)::int AS c FROM messages WHERE to_key=$1 AND is_read=FALSE', [toKey]);
+    return rows[0].c;
+  }
+  async findOpenMatchFor(key) {
+    const { rows } = await this.pool.query(`SELECT * FROM matches WHERE status IN ('waiting','playing')
+      AND (a_key=$1 OR b_key=$1) ORDER BY id DESC LIMIT 1`, [key]);
+    return PostgresStore._match(rows[0]) || null;
+  }
+  async findWaitingMatch(exceptKey) {
+    // SQLite dung datetime('now','-120 seconds'); Postgres dung NOW() - INTERVAL.
+    const { rows } = await this.pool.query(`SELECT * FROM matches WHERE status='waiting' AND a_key!=$1
+      AND created_at > NOW() - INTERVAL '120 seconds' ORDER BY id ASC LIMIT 1`, [exceptKey]);
+    return PostgresStore._match(rows[0]) || null;
+  }
+  async createMatch(aKey) {
+    const { rows } = await this.pool.query(
+      `INSERT INTO matches(a_key,status,created_at,updated_at) VALUES ($1,'waiting',$2,$3) RETURNING *`,
+      [aKey, nowISO(), nowISO()]);
+    return PostgresStore._match(rows[0]);
+  }
+  async getMatch(id) {
+    const { rows } = await this.pool.query('SELECT * FROM matches WHERE id=$1', [id]);
+    return PostgresStore._match(rows[0]) || null;
+  }
+  async updateMatch(id, fields) {
+    const allowed = new Set(['a_key', 'b_key', 'status', 'a_wins', 'b_wins', 'round_no', 'awarded']);
+    const keys = Object.keys(fields).filter((k) => allowed.has(k));
+    if (!keys.length) return;
+    const set = keys.map((k, i) => `${k}=$${i + 1}`).join(', ');
+    await this.pool.query(`UPDATE matches SET ${set}, updated_at=NOW() WHERE id=$${keys.length + 1}`,
+      [...keys.map((k) => fields[k]), id]);
+  }
+  async joinMatch(id, bKey) { await this.updateMatch(id, { b_key: bKey, status: 'playing' }); }
+  async getRound(matchId, roundNo) {
+    const { rows } = await this.pool.query('SELECT * FROM match_rounds WHERE match_id=$1 AND round_no=$2', [matchId, roundNo]);
+    return rows[0] || null;
+  }
+  async upsertRound(matchId, roundNo, kind, side, score) {
+    const ex = await this.getRound(matchId, roundNo);
+    if (!ex) {
+      await this.pool.query('INSERT INTO match_rounds(match_id,round_no,kind,a_score,b_score) VALUES ($1,$2,$3,$4,$5)',
+        [matchId, roundNo, kind, side === 'a' ? score : null, side === 'b' ? score : null]);
+    } else {
+      await this.pool.query(`UPDATE match_rounds SET ${side}_score=$1 WHERE match_id=$2 AND round_no=$3`,
+        [score, matchId, roundNo]);
+    }
+    return this.getRound(matchId, roundNo);
+  }
+  async listRounds(matchId) {
+    const { rows } = await this.pool.query('SELECT * FROM match_rounds WHERE match_id=$1 ORDER BY round_no', [matchId]);
+    return rows;
+  }
+}
+
+
+let store = null;
+async function initStore() {
+  // 1) Co DATABASE_URL -> thu Postgres truoc (Neon). Loi thi roi ve SQLite, khong crash.
+  if (process.env.DATABASE_URL) {
+    try {
+      store = await PostgresStore.create(process.env.DATABASE_URL);
+      ACTIVE_STORE_KIND = 'postgres';
+      let host = 'neon';
+      try { host = new URL(process.env.DATABASE_URL).host; } catch {}
+      console.log('[store] postgres:', host);
+      return store;
+    } catch (e) {
+      console.error('[store] postgres that bai, roi ve sqlite:', e.message);
+    }
+  }
+  // 2) SQLite mac dinh (hoac STORE=json ep buoc).
+  try {
+    if (STORE_KIND === 'json') throw new Error('forced json store');
+    store = new SqliteStore(path.join(DATA_DIR, 'scambuster.db'));
+    ACTIVE_STORE_KIND = 'sqlite';
+    console.log('[store] sqlite:', path.join(DATA_DIR, 'scambuster.db'));
+  } catch (e) {
+    store = new JsonStore(path.join(DATA_DIR, 'store.json'));
+    ACTIVE_STORE_KIND = 'json';
+    console.log('[store] json fallback:', e.message);
+  }
+  return store;
 }
 
 /* ================= API ================= */
@@ -344,12 +557,12 @@ function rateLimited(ip, key, limit = 30) {
   arr.push(now); rateMap.set(k, arr);
   return arr.length > limit;
 }
-function authPlayer(req, body) {
+async function authPlayer(req, body) {
   const token = body && body.token;
   if (!token || typeof token !== 'string') return null;
-  const sess = store.getSession(token); if (!sess) return null;
-  const player = store.getPlayerById(sess.player_id); if (!player) return null;
-  store.touchSession(token); store.touchPlayer(player.key);
+  const sess = await store.getSession(token); if (!sess) return null;
+  const player = await store.getPlayerById(sess.player_id); if (!player) return null;
+  await store.touchSession(token); await store.touchPlayer(player.key);
   return { player, token };
 }
 
@@ -360,23 +573,23 @@ async function handleApi(req, res, url) {
 
   // GET /api/health — kiem tra song, khong can dang nhap.
   if (url.pathname === '/api/health') {
-    const players = store.listPlayers();
+    const players = await store.listPlayers();
     const online = players.filter((p) => Date.now() - Date.parse(p.last_seen_at) < ONLINE_WINDOW_MS).length;
-    return sendJson(res, 200, { ok: true, version: VERSION, players: players.length, online, store: STORE_KIND });
+    return sendJson(res, 200, { ok: true, version: VERSION, players: players.length, online, store: ACTIVE_STORE_KIND });
   }
 
   // GET /api/state — cong khai, khong can dang nhap (giong ban fullstack cu):
   // tra TOAN BO nguoi choi, online truoc roi XP giam dan.
   if (url.pathname === '/api/state' && req.method === 'GET') {
     const nowMs = Date.now();
-    const players = store.listPlayers().map((p) => publicPlayer(p, nowMs))
+    const players = (await store.listPlayers()).map((p) => publicPlayer(p, nowMs))
       .sort((a, b) => (b.online - a.online) || (b.xp - a.xp) || (b.coins - a.coins));
     const onlineCount = players.filter((p) => p.online).length;
     return sendJson(res, 200, { ok: true, players, onlineCount, totalPlayers: players.length });
   }
   // GET /api/players.csv — xuat an danh cho giao vien (phuc vu NCKH): khong co mat khau.
   if (url.pathname === '/api/players.csv' && req.method === 'GET') {
-    const rows = store.listPlayers().map((p) => publicPlayer(p, Date.now()));
+    const rows = (await store.listPlayers()).map((p) => publicPlayer(p, Date.now()));
     const csv = 'name,gender,level,title,xp,coins,streak,wins,online,isShowcase\n' +
       rows.map((p) => [p.name, p.gender, p.level, `"${p.title}"`, p.xp, p.coins, p.streak, p.wins, p.online ? 1 : 0, p.isShowcase ? 1 : 0].join(',')).join('\n');
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="scambuster-players.csv"' });
@@ -392,9 +605,9 @@ async function handleApi(req, res, url) {
     const pass = String(body.pass || ''); const gender = body.gender === 'female' ? 'female' : 'male';
     if (name.length < 2) return sendJson(res, 400, { ok: false, error: 'Ten dang nhap can it nhat 2 ky tu.' });
     if (pass.length < 4) return sendJson(res, 400, { ok: false, error: 'Mat khau can it nhat 4 ky tu.' });
-    if (store.getPlayerByKey(key)) return sendJson(res, 409, { ok: false, error: 'Ten dang nhap nay da co nguoi dung. Neu la ban, hay bam Dang nhap va nhap dung mat khau.' });
-    const player = store.insertPlayer({ key, name, gender, pass_hash: hashPassword(pass) });
-    const token = newToken(); store.createSession(player.id, token);
+    if (await store.getPlayerByKey(key)) return sendJson(res, 409, { ok: false, error: 'Ten dang nhap nay da co nguoi dung. Neu la ban, hay bam Dang nhap va nhap dung mat khau.' });
+    const player = await store.insertPlayer({ key, name, gender, pass_hash: hashPassword(pass) });
+    const token = newToken(); await store.createSession(player.id, token);
     return sendJson(res, 200, { ok: true, token, player: fullPlayer(player) });
   }
 
@@ -402,15 +615,15 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/login') {
     if (rateLimited(ip, 'login')) return sendJson(res, 429, { ok: false, error: 'Ban thao tac qua nhanh, thu lai sau 1 phut.' });
     const key = normKey(body.name);
-    const player = store.getPlayerByKey(key);
+    const player = await store.getPlayerByKey(key);
     if (!player || !player.pass_hash) return sendJson(res, 404, { ok: false, error: `Chua co tai khoan "${displayName(body.name)}" — hay bam Dang ky moi de tao tai khoan truoc.` });
     if (!verifyPassword(String(body.pass || ''), player.pass_hash)) return sendJson(res, 401, { ok: false, error: 'Mat khau chua dung, ban thu lai nhe.' });
-    const token = newToken(); store.createSession(player.id, token);
+    const token = newToken(); await store.createSession(player.id, token);
     return sendJson(res, 200, { ok: true, token, player: fullPlayer(player) });
   }
 
   // Cac endpoint duoi day can token.
-  const auth = authPlayer(req, body);
+  const auth = await authPlayer(req, body);
   if (!auth && !['/api/logout'].includes(url.pathname)) {
     // /api/logout van tra ok du token het han (de client xoa token cho sach).
     if (url.pathname === '/api/logout') return sendJson(res, 200, { ok: true });
@@ -419,10 +632,10 @@ async function handleApi(req, res, url) {
   const me = auth?.player;
 
   // POST /api/me — lay lai tien trinh day du sau khi doi may / tai lai trang.
-  if (url.pathname === '/api/me') return sendJson(res, 200, { ok: true, player: fullPlayer(me), unread: store.unreadCount(me.key) });
+  if (url.pathname === '/api/me') return sendJson(res, 200, { ok: true, player: fullPlayer(me), unread: await store.unreadCount(me.key) });
 
   // POST /api/logout
-  if (url.pathname === '/api/logout') { if (auth) store.deleteSession(auth.token); return sendJson(res, 200, { ok: true }); }
+  if (url.pathname === '/api/logout') { if (auth) await store.deleteSession(auth.token); return sendJson(res, 200, { ok: true }); }
 
   // POST /api/heartbeat — client goi moi 25 giay khi dang dang nhap; online = lastSeen < 60 giay.
   if (url.pathname === '/api/heartbeat') return sendJson(res, 200, { ok: true, online: true });
@@ -432,7 +645,7 @@ async function handleApi(req, res, url) {
     const today = todayKeyVN();
     if (me.checked_day === today) return sendJson(res, 200, { ok: true, already: true, streak: me.streak, xp: me.xp, coins: me.coins, checkedDay: today });
     const streak = (me.streak || 0) + 1; const xp = me.xp + 5; const coins = me.coins + 15;
-    store.updatePlayer(me.key, { streak, checked_day: today, xp, coins, last_seen_at: nowISO() });
+    await store.updatePlayer(me.key, { streak, checked_day: today, xp, coins, last_seen_at: nowISO() });
     return sendJson(res, 200, { ok: true, already: false, streak, xp, coins, checkedDay: today });
   }
 
@@ -456,7 +669,7 @@ async function handleApi(req, res, url) {
       threads: asObject(st.threads),
       unread: asObject(st.unread),
     };
-    store.updatePlayer(me.key, { xp, coins, wins, state_json: JSON.stringify(merged), last_seen_at: nowISO() });
+    await store.updatePlayer(me.key, { xp, coins, wins, state_json: JSON.stringify(merged), last_seen_at: nowISO() });
     return sendJson(res, 200, { ok: true, xp, coins, wins });
   }
 
@@ -465,54 +678,54 @@ async function handleApi(req, res, url) {
     const toKey = normKey(body.to); const text = String(body.body || '').trim();
     if (!text || text.length > 500) return sendJson(res, 400, { ok: false, error: 'Tin nhan can 1-500 ky tu.' });
     if (toKey === me.key) return sendJson(res, 400, { ok: false, error: 'Khong gui tin cho chinh minh.' });
-    const to = store.getPlayerByKey(toKey);
+    const to = await store.getPlayerByKey(toKey);
     if (!to) return sendJson(res, 404, { ok: false, error: 'Khong tim thay nguoi nhan.' });
-    const id = store.insertMessage(me.key, to.key, text);
+    const id = await store.insertMessage(me.key, to.key, text);
     return sendJson(res, 200, { ok: true, id });
   }
   // GET /api/messages?token=...&with=TEN — lay hoi thoai 2 chieu, danh dau da doc.
   if (url.pathname === '/api/messages' && req.method === 'GET') {
     const withKey = normKey(url.searchParams.get('with') || '');
-    const partner = store.getPlayerByKey(withKey);
+    const partner = await store.getPlayerByKey(withKey);
     if (!partner) return sendJson(res, 404, { ok: false, error: 'Khong tim thay nguoi nay.' });
-    const rows = store.thread(me.key, withKey).map((m) => ({
+    const rows = (await store.thread(me.key, withKey)).map((m) => ({
       id: m.id, mine: m.from_key === me.key, body: m.body, at: Date.parse(m.created_at),
     }));
-    store.markRead(me.key, withKey);
+    await store.markRead(me.key, withKey);
     return sendJson(res, 200, { ok: true, messages: rows });
   }
 
   // --- Dau truong truc tiep 2 nguoi (polling, khong can WebSocket) ---
   // POST /api/arena/quickmatch — vao hang cho; neu co nguoi dang cho thi ghep ngay.
   if (url.pathname === '/api/arena/quickmatch') {
-    const open = store.findOpenMatchFor(me.key);
-    if (open) return sendJson(res, 200, { ok: true, match: matchView(open, me.key) });
-    const waiting = store.findWaitingMatch(me.key);
-    if (waiting) { store.joinMatch(waiting.id, me.key); return sendJson(res, 200, { ok: true, match: matchView(store.getMatch(waiting.id), me.key) }); }
-    const m = store.createMatch(me.key);
-    return sendJson(res, 200, { ok: true, match: matchView(m, me.key), waiting: true });
+    const open = await store.findOpenMatchFor(me.key);
+    if (open) return sendJson(res, 200, { ok: true, match: await matchView(open, me.key) });
+    const waiting = await store.findWaitingMatch(me.key);
+    if (waiting) { await store.joinMatch(waiting.id, me.key); return sendJson(res, 200, { ok: true, match: await matchView(await store.getMatch(waiting.id), me.key) }); }
+    const m = await store.createMatch(me.key);
+    return sendJson(res, 200, { ok: true, match: await matchView(m, me.key), waiting: true });
   }
   // POST /api/arena/status — client hoi moi 2-3 giay khi dang cho/dau.
   if (url.pathname === '/api/arena/status') {
-    const m = store.getMatch(body.matchId) || store.findOpenMatchFor(me.key);
+    const m = (await store.getMatch(body.matchId)) || (await store.findOpenMatchFor(me.key));
     if (!m) return sendJson(res, 200, { ok: true, match: null });
-    return sendJson(res, 200, { ok: true, match: matchView(m, me.key) });
+    return sendJson(res, 200, { ok: true, match: await matchView(m, me.key) });
   }
   // POST /api/arena/submit-round {matchId, roundNo, kind, score}
   // The thang: Quiz – Race – Quiz, thang 2/3 luot. Thang tran: +30 XP/+25 coins/+1 win;
   // thua: +8 XP/+5 coins; hoa: +12 XP/+10 coins (giong ban tinh dau Bot).
   if (url.pathname === '/api/arena/submit-round') {
-    const m = store.getMatch(body.matchId);
+    const m = await store.getMatch(body.matchId);
     if (!m || m.status !== 'playing') return sendJson(res, 400, { ok: false, error: 'Tran dau khong con hieu luc.' });
     const side = m.a_key === me.key ? 'a' : (m.b_key === me.key ? 'b' : null);
     if (!side) return sendJson(res, 403, { ok: false, error: 'Ban khong o trong tran nay.' });
     const roundNo = clampInt(body.roundNo, 1, 3, m.round_no);
     const kind = roundNo === 2 ? 'race' : 'quiz';
     const score = clampInt(body.score, 0, 100000, 0);
-    const round = store.upsertRound(m.id, roundNo, kind, side, score);
-    let view = matchView(store.getMatch(m.id), me.key);
+    const round = await store.upsertRound(m.id, roundNo, kind, side, score);
+    let view = await matchView(await store.getMatch(m.id), me.key);
     if (round.a_score != null && round.b_score != null) {
-      const cur = store.getMatch(m.id);
+      const cur = await store.getMatch(m.id);
       let aWins = cur.a_wins; let bWins = cur.b_wins;
       if (round.a_score > round.b_score) aWins++;
       else if (round.b_score > round.a_score) bWins++;
@@ -520,34 +733,34 @@ async function handleApi(req, res, url) {
       let status = cur.status; let nextRound = cur.round_no;
       if (aWins >= 2 || bWins >= 2 || roundNo >= 3) status = 'finished';
       else nextRound = roundNo + 1;
-      store.updateMatch(m.id, { a_wins: aWins, b_wins: bWins, round_no: nextRound, status });
+      await store.updateMatch(m.id, { a_wins: aWins, b_wins: bWins, round_no: nextRound, status });
       if (status === 'finished' && !cur.awarded) {
-        store.updateMatch(m.id, { awarded: 1 });
-        awardArenaResult(store.getMatch(m.id));
+        await store.updateMatch(m.id, { awarded: 1 });
+        await awardArenaResult(await store.getMatch(m.id));
       }
-      view = matchView(store.getMatch(m.id), me.key);
+      view = await matchView(await store.getMatch(m.id), me.key);
     }
     return sendJson(res, 200, { ok: true, match: view });
   }
   // POST /api/arena/forfeit {matchId}
   if (url.pathname === '/api/arena/forfeit') {
-    const m = store.getMatch(body.matchId);
+    const m = await store.getMatch(body.matchId);
     if (!m || m.status !== 'playing') return sendJson(res, 400, { ok: false, error: 'Tran dau khong con hieu luc.' });
     const side = m.a_key === me.key ? 'a' : (m.b_key === me.key ? 'b' : null);
     if (!side) return sendJson(res, 403, { ok: false, error: 'Ban khong o trong tran nay.' });
     const finished = { ...m, a_wins: side === 'a' ? m.a_wins : 2, b_wins: side === 'b' ? m.b_wins : 2, status: 'finished' };
-    store.updateMatch(m.id, { a_wins: finished.a_wins, b_wins: finished.b_wins, status: 'finished' });
-    if (!m.awarded) { store.updateMatch(m.id, { awarded: 1 }); awardArenaResult(store.getMatch(m.id)); }
-    return sendJson(res, 200, { ok: true, match: matchView(store.getMatch(m.id), me.key) });
+    await store.updateMatch(m.id, { a_wins: finished.a_wins, b_wins: finished.b_wins, status: 'finished' });
+    if (!m.awarded) { await store.updateMatch(m.id, { awarded: 1 }); await awardArenaResult(await store.getMatch(m.id)); }
+    return sendJson(res, 200, { ok: true, match: await matchView(await store.getMatch(m.id), me.key) });
   }
 
   return sendJson(res, 404, { ok: false, error: 'Khong co API nay.' });
 }
 
-function matchView(m, myKey) {
+async function matchView(m, myKey) {
   if (!m) return null;
-  const rounds = store.listRounds(m.id).map((r) => ({ roundNo: r.round_no, kind: r.kind, aScore: r.a_score, bScore: r.b_score }));
-  const a = store.getPlayerByKey(m.a_key); const b = m.b_key ? store.getPlayerByKey(m.b_key) : null;
+  const rounds = (await store.listRounds(m.id)).map((r) => ({ roundNo: r.round_no, kind: r.kind, aScore: r.a_score, bScore: r.b_score }));
+  const a = await store.getPlayerByKey(m.a_key); const b = m.b_key ? await store.getPlayerByKey(m.b_key) : null;
   const iAmA = m.a_key === myKey;
   const meP = iAmA ? a : b; const opP = iAmA ? b : a;
   return { id: m.id, status: m.status, roundNo: m.round_no,
@@ -557,16 +770,16 @@ function matchView(m, myKey) {
     rounds: rounds.map((r) => ({ roundNo: r.roundNo, kind: r.kind,
       myScore: iAmA ? r.aScore : r.bScore, opScore: iAmA ? r.bScore : r.aScore })) };
 }
-function awardArenaResult(m) {
-  const a = store.getPlayerByKey(m.a_key); const b = m.b_key ? store.getPlayerByKey(m.b_key) : null;
+async function awardArenaResult(m) {
+  const a = await store.getPlayerByKey(m.a_key); const b = m.b_key ? await store.getPlayerByKey(m.b_key) : null;
   if (!a || !b) return;
-  const apply = (p, xp, coins, win) => {
+  const apply = async (p, xp, coins, win) => {
     if (p.is_showcase) return; // nguoi mau khong nhan thuong that
-    store.updatePlayer(p.key, { xp: p.xp + xp, coins: p.coins + coins, wins: p.wins + (win ? 1 : 0) });
+    await store.updatePlayer(p.key, { xp: p.xp + xp, coins: p.coins + coins, wins: p.wins + (win ? 1 : 0) });
   };
-  if (m.a_wins > m.b_wins) { apply(a, 30, 25, true); apply(b, 8, 5, false); }
-  else if (m.b_wins > m.a_wins) { apply(b, 30, 25, true); apply(a, 8, 5, false); }
-  else { apply(a, 12, 10, false); apply(b, 12, 10, false); }
+  if (m.a_wins > m.b_wins) { await apply(a, 30, 25, true); await apply(b, 8, 5, false); }
+  else if (m.b_wins > m.a_wins) { await apply(b, 30, 25, true); await apply(a, 8, 5, false); }
+  else { await apply(a, 12, 10, false); await apply(b, 12, 10, false); }
 }
 
 /* ================= HTTP SERVER ================= */
@@ -590,15 +803,15 @@ const server = http.createServer(async (req, res) => {
       // GET /api/messages la GET co query token; cac API GET khac khong can body.
       if (url.pathname === '/api/messages' && req.method === 'GET') {
         const token = url.searchParams.get('token') || '';
-        const sess = store.getSession(token);
+        const sess = await store.getSession(token);
         if (!sess) return sendJson(res, 401, { ok: false, error: 'Phien dang nhap het han, hay dang nhap lai.' });
-        const me = store.getPlayerById(sess.player_id);
-        store.touchSession(token); store.touchPlayer(me.key);
+        const me = await store.getPlayerById(sess.player_id);
+        await store.touchSession(token); await store.touchPlayer(me.key);
         const withKey = normKey(url.searchParams.get('with') || '');
-        const partner = store.getPlayerByKey(withKey);
+        const partner = await store.getPlayerByKey(withKey);
         if (!partner) return sendJson(res, 404, { ok: false, error: 'Khong tim thay nguoi nay.' });
-        const rows = store.thread(me.key, withKey).map((m) => ({ id: m.id, mine: m.from_key === me.key, body: m.body, at: Date.parse(m.created_at) }));
-        store.markRead(me.key, withKey);
+        const rows = (await store.thread(me.key, withKey)).map((m) => ({ id: m.id, mine: m.from_key === me.key, body: m.body, at: Date.parse(m.created_at) }));
+        await store.markRead(me.key, withKey);
         return sendJson(res, 200, { ok: true, messages: rows });
       }
       return await handleApi(req, res, url);
@@ -611,7 +824,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`ScamBuster server chay tai http://localhost:${PORT} (store=${STORE_KIND}, version ${VERSION})`);
-  console.log(`Kiem tra: curl http://localhost:${PORT}/api/health`);
-});
+// Chi tu chay khi go `node server.js`. Khi duoc require() tu test (pg-mem),
+// test se tu gan store Postgres bang setStore() roi tu listen — khong tu chay.
+if (require.main === module) {
+  initStore().then(() => {
+    server.listen(PORT, () => {
+      console.log(`ScamBuster server chay tai http://localhost:${PORT} (store=${ACTIVE_STORE_KIND}, version ${VERSION})`);
+      console.log(`Kiem tra: curl http://localhost:${PORT}/api/health`);
+    });
+  }).catch((e) => { console.error('[store] khoi tao that bai:', e); process.exit(1); });
+}
+
+module.exports = { server, handleApi, initStore, PostgresStore, SqliteStore, JsonStore,
+  getStore: () => store,
+  setStore: (s, kind) => { store = s; if (kind) ACTIVE_STORE_KIND = kind; },
+  getStoreKind: () => ACTIVE_STORE_KIND, VERSION };

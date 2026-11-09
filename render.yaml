@@ -1,8 +1,10 @@
 # Render Blueprint — ScamBuster server
 # Cach dung: day thu muc nay len GitHub, vao Render > New > Blueprint,
 # chon repo nay. Render se tu tao web service theo file nay.
-# Luu y: goi free KHONG co o dia ben vung — du lieu SQLite se mat khi
-# redeploy. Muon giu lau dai thi nang cap goi tra phi + gan disk (xem README).
+# Luu tru ben: them bien DATABASE_URL (chuoi ket noi Neon Postgres) trong
+# Render Dashboard > service > Environment (KHONG ghi chuoi that vao file
+# nay). Neu chua co DATABASE_URL, server van chay bang SQLite tam thoi
+# (du lieu se mat khi redeploy — chi dung tam).
 services:
   - type: web
     name: scambuster-server
@@ -17,4 +19,6 @@ services:
         value: ./data
       - key: STORE
         value: sqlite
+      - key: DATABASE_URL
+        sync: false # dat tay trong Dashboard: postgres://user:pass@ep-xxx...neon.tech/neondb?sslmode=require
     healthCheckPath: /api/health
